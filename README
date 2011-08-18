@@ -30,3 +30,5 @@ This app also need the following external binaries:
 - mplayer
 - youtube-dl
 
+You will need the OAuth2 keys from Twitter before you can communicate with Twitter.
+After getting the keys from dev.twitter.com add them to tweet-jee variable TWITTER_KEYS.
