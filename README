@@ -1,0 +1,32 @@
+README
+
+Tweet-jee is a tweet bot written in python and is able to retreive youtube links from mention tweets.
+After that it will try to download these videos and put it on the playlist.
+
+The playlist is devided in three parts; high, medium and normal queue. The high queue will
+always been played at once till it becomes empty then the medium queue will be played.
+If the high and medium queues are empty it will start playing randomly from the normal queue.
+
+
+Usage: tweet-jee [-h|--help] -s|--server or -p|--player or -i|--initialize or -q|--queue or -P|--promote <filename>
+                 -s|--server     Process all mentions tweets and look for youtube links
+                                 download the videos and add them to the high queue.
+                 -p|--player     Play the videos from the high and medium queue
+                                 then random play the normal queue.
+                 -i|--initialize This will generate a normal queue from all files
+                                 found in the download directory.
+                 -q|--queue      Show the current high and medium queue.
+                 -P|--promote    Promote the file to medium queue.
+
+
+INSTALL
+
+You need at least python 2.6 and the following modules:
+- python-twitter
+- python-urllib2
+- python-sqlite3
+
+This app also need the following external binaries:
+- mplayer
+- youtube-dl
+

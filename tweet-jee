@@ -1,0 +1,369 @@
+#!/usr/bin/python
+import twitter
+import re
+import os
+import urllib2
+from time import sleep
+import subprocess
+from subprocess import call
+import getopt
+import sys
+import time
+import sqlite3
+
+DB               = None
+API              = None
+SQLITEDB         = 'tweet-jee.sqlite'
+DOWNLOAD_DIR     = 'youtube'
+PATH_YOUTUBE_DL  = '/usr/bin/youtube-dl'
+PATH_MPLAYER     = '/usr/bin/mplayer'
+ENVIRONMENT      = 'prod' # different settings for prod/dev
+
+# [consumer_key, consumer_secret, access_token_key, access_token_secret]
+TWITTER_KEYS     = ['DEFINE',
+                    'DEFINE',
+                    'DEFINE',
+                    'DEFINE']
+TWITTER_KEYS_DEV = ['OPTIONAL',
+                    'OPTIONAL',
+                    'OPTIONAL'
+                    'OPTIONAL']
+
+
+##### Helper functions #####
+def usage():
+    print 'Usage: tweet-jee [-h|--help] -s|--server or -p|--player or -i|--initialize or -q|--queue or -P|--promote <filename>'
+    print '                 -s|--server     Process all mentions tweets and look for youtube links'
+    print '                                 download the videos and add them to the high queue.'
+    print '                 -p|--player     Play the videos from the high and medium queue'
+    print '                                 then random play the normal queue.'
+    print '                 -i|--initialize This will generate a normal queue from all files'
+    print '                                 found in the download directory.'
+    print '                 -q|--queue      Show the current high and medium queue.'
+    print '                 -P|--promote    Promote the file to medium queue.'
+
+
+def queuesize(queue):
+    c = DB.cursor()
+    c.execute('SELECT COUNT(*) FROM videos WHERE queue=?',(queue,))
+    (result) = c.fetchone()
+    return result[0]    
+
+
+def getuserbyvideo(video):
+    username = ''
+    c = DB.cursor()
+    c.execute('SELECT user FROM tweets WHERE id=?',(video[1],)) #videos.tweet_id
+    (result) = c.fetchone()
+    if result != None:
+        username = result[0]
+    return username
+
+
+def dbconnect():
+    global DB
+    DB = sqlite3.connect(SQLITEDB)
+    try:
+        c = DB.cursor()
+        c.execute('SELECT count(*) FROM tweets')
+        tweets = c.fetchone()
+        c.execute('SELECT count(*) FROM videos')
+        videos = c.fetchone()
+    except sqlite3.OperationalError:
+        dbinit()
+        pass
+
+
+def twitterinit():
+    global API
+    API = twitter.Api(TWITTER_KEYS[0], TWITTER_KEYS[1], TWITTER_KEYS[2], TWITTER_KEYS[3]) 
+
+
+def do_tweet(tweet):
+    tweet = tweet[:140] # chop to max
+    print "tweeting: " + tweet
+    try:
+        API.PostUpdate(tweet)
+    except twitter.TwitterError, e:
+        print 'TwitterError: '+e.message
+        pass
+
+
+##### Videoplayer functions #####
+def videoplayer():
+    while True:
+        while queuesize('high') != 0:
+            # select the first song from high queue, ordered by tweet_id (lower id = older tweet, will go first)
+            print 'fetching song from high'
+            c = DB.cursor()
+            c.execute('SELECT * FROM videos WHERE queue="high" ORDER BY tweet_id LIMIT 1')
+            video = c.fetchone()
+            playvideo(video)
+
+        while queuesize('medium') != 0:
+            # select the first song from medium queue, ordered by tweet_id (lower id = older tweet, will go first)
+            print 'fetching song from medium'
+            c = DB.cursor()
+            c.execute('SELECT * FROM videos WHERE queue="medium" ORDER BY tweet_id LIMIT 1')
+            video = c.fetchone()
+            playvideo(video)
+                        
+        # no high songs left, randomly pick one from normal (=low)
+        if queuesize('normal') != 0:
+            print 'fetching random song from normal'
+            c = DB.cursor()
+            c.execute('SELECT * FROM videos WHERE queue="normal" ORDER BY RANDOM() LIMIT 1')
+            video = c.fetchone()
+            playvideo(video)
+        else:
+            print 'no songs in queues, sleeping 5 sec'
+            sleep(5)
+
+
+def playvideo(video):
+    print video
+    # fields: id, tweet_id, url, filename, songname, playcount, lastplayed, queue
+ 
+    # move it to normal queue, increase playcount, update lastplayed    
+    c = DB.cursor()
+    c.execute('UPDATE videos SET queue="normal", playcount=playcount+1, lastplayed=DATETIME() WHERE id=?', (video[0],) )
+    DB.commit()
+    
+    # tweet current song and user who requested it
+    # todo: non-blockng; tweet upcoming 3 songs (if in high queue), encourage people to add new songs if no in high
+   
+    # tweet songtitle + user if available
+    if video[4] != '': # songname
+        tweet = "Now playing '" + video[4] + "'"
+        username = getuserbyvideo(video)    
+        if username != '':
+            tweet += " by @" + username
+        #print tweet
+        do_tweet(tweet)
+        
+    # execute mplayer
+    retcode = call([PATH_MPLAYER,'-fs', DOWNLOAD_DIR + '/' + video[3]])
+    sleep(1)
+
+
+##### Initialize functions #####
+def dbinit():
+    c = DB.cursor()
+    c.execute('DROP TABLE IF EXISTS tweets')
+    c.execute('CREATE TABLE tweets (id INTEGER PRIMARY KEY, user TEXT, time TEXT, message TEXT)')
+    c.execute('DROP TABLE IF EXISTS videos')
+    c.execute('CREATE TABLE videos (id INTEGER PRIMARY KEY, tweet_id INTEGER, url TEXT, filename TEXT UNIQUE, songname TEXT, playcount INTEGER, lastplayed TEXT, queue TEXT )')
+
+
+def init_downloads():
+    # fill database with existing downloads from download folder (without tweet-id, url) put them in normal
+    for filename in os.listdir(DOWNLOAD_DIR):
+        if '.mp4' in filename:
+            # determine songname from filename
+            songname = filename
+            m = re.match(r"([^-]+)-", filename)
+            if m != None:
+                matches = m.groups()
+                songname = matches[0]
+                songname = songname.replace('_',' ')                
+
+            # insert video into database with normal queue
+            c = DB.cursor()
+            c.execute('INSERT INTO videos (filename, songname, queue, playcount) VALUES (?,?,"normal",0)', (filename,songname) )
+            DB.commit()
+            print "video added to the normal queue: " + songname  
+            
+
+##### Server functions #####
+def tweetserver():
+    while True:
+        gettweets()
+        sleep(12) # max 350 requests per hour
+
+
+def gettweets(sendreply=True): # param allows disabling outgoing tweets
+    # get new tweets, insert them into the db and parse them, and tweet the result
+    try:
+        mentions = API.GetMentions()
+        for mention in reversed(mentions):
+            tweet = {}
+            tweet['id'] = mention.id
+            tweet['user'] = mention.user.screen_name
+            tweet['time'] = mention.created_at
+            tweet['message'] = mention.text
+                
+            c = DB.cursor()
+            c.execute('SELECT COUNT(*) FROM tweets WHERE id=?',(tweet['id'],))
+            (result) = c.fetchone()        
+            if result[0] == 0:
+                c.execute('INSERT INTO tweets VALUES (?,?,?,?)', (tweet['id'],tweet['user'],tweet['time'],tweet['message']) )
+                DB.commit()
+                print 'inserted new incoming tweet: '
+                print tweet
+                replymessage = parsetweet(tweet)
+            
+                if replymessage == None:
+                    # retry 3x with 10,20 sec delay
+                    sleep(10)
+                    replymessage = parsetweet(tweet)
+                    if replymessage == None:
+                        sleep(20)
+                        replymessage = parsetweet(tweet)
+                        if replymessage == None:
+                            # final fuckup
+                            replymessage = "unable to download video, please try again later"
+            
+                # always feedback to the user
+                replymessage = "@" + tweet['user'] + " " + replymessage
+                if sendreply:
+                    do_tweet(replymessage)
+                else:
+                    print "would normally reply: " + replymessage
+
+    except twitter.TwitterError, e:
+        print 'TwitterError: '+e.message
+        pass
+
+
+def parsetweet(tweet):
+    # extract URL
+    m = re.search(r"(http://[^ ]+)", tweet['message'])
+    if m == None:
+        return None
+
+    url = m.groups()[0]
+    print 'extracted url: ' + url
+
+    m = re.match(r"http://(www\.)?(youtube.com|youtu.be|t.co)/", url)
+    if m == None:
+        return 'unable to find YouTube URL in: ' + url
+
+    # fetch URL once to filter out any redirects
+    try:
+        print 'pre-fetching ' + url
+        f = urllib2.urlopen(url)
+        url = f.geturl()
+    except urllib2.URLError:
+        return None # will trigger retry
+    except UnicodeEncodeError:
+        return 'something went wrong while opening: ' + url
+    
+    # now try to download the video
+    # TODO allow download retries on top of youtube-dl default
+    try:
+        print 'starting download of ' + url
+        result = subprocess.check_output([PATH_YOUTUBE_DL, '-q', '--no-mtime', '-t', '-f', '22', url],
+                                     stderr=subprocess.STDOUT)
+        for filename in os.listdir('.'):
+            if '.mp4' in filename:
+                # download was succesfull, now move it to final directory
+                print 'download succesful'
+                if not os.path.exists(DOWNLOAD_DIR):
+                    os.mkdir(DOWNLOAD_DIR, 0755)
+                os.rename(filename, DOWNLOAD_DIR+'/'+filename)
+                
+                # determine songname from filename
+                songname  = url
+                m = re.match(r"([^-]+)-", filename)
+                if m != None:
+                    matches = m.groups()
+                    songname = matches[0]
+                    songname = songname.replace('_',' ')                
+                
+                # TODO implement video duplicate checking, should also prevent unnecessary re-downloads
+                # insert video into database with high queue by default
+                
+                c = DB.cursor()
+                try:
+                    c.execute('INSERT INTO videos (tweet_id, url, filename, songname, queue, playcount) VALUES (?,?,?,?,"high",0)', (tweet['id'],url,filename,songname) )
+                    DB.commit()
+                    return "video added to the queue at position " + str(queuesize('high')) +": " + songname
+                except sqlite3.IntegrityError:
+                    print 'bumped into unique constraint for filename (already exists)'
+                    c.execute('UPDATE videos SET tweet_id=?, url=?, queue="high", lastplayed="" WHERE filename=?', (tweet['id'],url,filename) )
+                    DB.commit()
+                    return "video added to the queue at position "+ str(queuesize('high')) + ": " + songname
+        
+    except subprocess.CalledProcessError, e:
+        print e.output
+        if 'format not available' in e.output:
+            return 'video '+url+' failed, video not available in HD (720p).'
+        return None
+    
+
+##### Queue functions #####
+def showqueue():
+    c = DB.cursor()
+    c.execute('SELECT queue, songname FROM videos WHERE queue != "normal" ORDER BY queue, tweet_id')
+    (result) = c.fetchall()
+    if len(result) == 0:
+        print 'No videos on high or medium queue.'
+    for item in result:
+        print item[0] + ' === ' + item[1]
+
+
+##### Promote functions #####
+def promote(filename):
+    c = DB.cursor()
+    c.execute('UPDATE videos SET queue="medium" WHERE filename=?', (filename,))
+    DB.commit()
+    print 'Video '+filename+' promoted to medium queue.'
+
+
+##### Main function #####
+def main(argv=None):
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], 'hspdiqP:', ['help', 'server', 'player', 'development', 'initialize', 'queue', 'promote'])
+    except getopt.GetoptError, e:
+        print str(e)
+        usage()
+        sys.exit(1)
+
+    option = 2
+    filename = ''
+    global ENVIRONMENT, TWITTER_KEYS
+    for o, a in opts:
+        if o in ('-h', '--help'):
+            usage()
+            sys.exit()
+        elif o in ('-s', '--server'):
+            option = 1
+        elif o in ('-p', '--player'):
+            option = 0
+        elif o in ('-d', '--development'):
+            ENVIRONMENT = 'dev'
+            TWITTER_KEYS = TWITTER_KEYS_DEV
+        elif o in ('-i', '--initialize'):
+            option = 3
+        elif o in ('-q', '--queue'):
+            option = 4
+        elif o in ('-P', '--promote'):
+            option = 5
+            filename = a
+        else:
+            assert False, 'unhandled option'
+
+    dbconnect()
+    twitterinit()
+
+    if option == 2:
+        usage()
+        sys.exit(1)
+    if option == 1:
+        tweetserver()
+    if option == 0:
+        videoplayer()
+    if option == 3:
+        dbinit()
+        init_downloads() # fill existing downloads to normal queue
+        gettweets(False) # fetch latest tweets and prevent tweeting about results
+        print "database initialization complete."
+        sys.exit()
+    if option == 4:
+        showqueue()
+    if option == 5:
+        promote(filename)
+
+
+if __name__ == '__main__':
+   main()
