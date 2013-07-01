@@ -20,10 +20,10 @@ PATH_MPLAYER     = '/usr/bin/mplayer'
 ENVIRONMENT      = 'prod' # different settings for prod/dev
 
 # [consumer_key, consumer_secret, access_token_key, access_token_secret]
-TWITTER_KEYS     = ['DEFINE',
-                    'DEFINE',
-                    'DEFINE',
-                    'DEFINE']
+TWITTER_KEYS     = ['REQUIRED',
+                    'REQUIRED',
+                    'REQUIRED',
+                    'REQUIRED']
 TWITTER_KEYS_DEV = ['OPTIONAL',
                     'OPTIONAL',
                     'OPTIONAL'
@@ -76,7 +76,7 @@ def dbconnect():
 
 def twitterinit():
     global API
-    API = twitter.Api(TWITTER_KEYS[0], TWITTER_KEYS[1], TWITTER_KEYS[2], TWITTER_KEYS[3]) 
+    API = twitter.Api(TWITTER_KEYS[0], TWITTER_KEYS[1], TWITTER_KEYS[2], TWITTER_KEYS[3])
 
 
 def do_tweet(tweet):
@@ -85,7 +85,7 @@ def do_tweet(tweet):
     try:
         API.PostUpdate(tweet)
     except twitter.TwitterError, e:
-        print 'TwitterError: '+e.message
+        print 'TwitterError: '+str(e)
         pass
 
 
@@ -177,7 +177,7 @@ def init_downloads():
 ##### Server functions #####
 def tweetserver():
     while True:
-        gettweets()
+        gettweets(False)
         sleep(12) # max 350 requests per hour
 
 
@@ -191,7 +191,11 @@ def gettweets(sendreply=True): # param allows disabling outgoing tweets
             tweet['user'] = mention.user.screen_name
             tweet['time'] = mention.created_at
             tweet['message'] = mention.text
-                
+            print mention.text
+            url = parsetweet(tweet)
+            if url == False:
+                continue;
+
             c = DB.cursor()
             c.execute('SELECT COUNT(*) FROM tweets WHERE id=?',(tweet['id'],))
             (result) = c.fetchone()        
@@ -200,16 +204,16 @@ def gettweets(sendreply=True): # param allows disabling outgoing tweets
                 DB.commit()
                 print 'inserted new incoming tweet: '
                 print tweet
-                replymessage = parsetweet(tweet)
+                replymessage = download(url, tweet)
             
-                if replymessage == None:
+                if replymessage == False:
                     # retry 3x with 10,20 sec delay
                     sleep(10)
-                    replymessage = parsetweet(tweet)
-                    if replymessage == None:
+                    replymessage = download(url, tweet)
+                    if replymessage == False:
                         sleep(20)
-                        replymessage = parsetweet(tweet)
-                        if replymessage == None:
+                        replymessage = download(url, tweet)
+                        if replymessage == False:
                             # final fuckup
                             replymessage = "unable to download video, please try again later"
             
@@ -221,30 +225,34 @@ def gettweets(sendreply=True): # param allows disabling outgoing tweets
                     print "would normally reply: " + replymessage
 
     except twitter.TwitterError, e:
-        print 'TwitterError: '+e.message
+        print 'TwitterError: '+str(e)
         pass
 
 
 def parsetweet(tweet):
     # extract URL
-    m = re.search(r"(http://[^ ]+)", tweet['message'])
+    m = re.search(r"(https?://[^ ]+)", tweet['message'])
     if m == None:
-        return None
+        return False
 
     url = m.groups()[0]
     print 'extracted url: ' + url
 
-    m = re.match(r"http://(www\.)?(youtube.com|youtu.be|t.co)/", url)
+    m = re.match(r"https?://(www\.)?(youtube.com|youtu.be|t.co)/", url)
     if m == None:
-        return 'unable to find YouTube URL in: ' + url
+        return False
 
+    return url
+
+
+def download(url, tweet):
     # fetch URL once to filter out any redirects
     try:
         print 'pre-fetching ' + url
         f = urllib2.urlopen(url)
         url = f.geturl()
     except urllib2.URLError:
-        return None # will trigger retry
+        return False # will trigger retry
     except UnicodeEncodeError:
         return 'something went wrong while opening: ' + url
     
@@ -256,8 +264,8 @@ def parsetweet(tweet):
                                      stderr=subprocess.STDOUT)
         for filename in os.listdir('.'):
             if '.mp4' in filename:
-                # download was succesfull, now move it to final directory
-                print 'download succesful'
+                # download was successful, now move it to final directory
+                print 'download successful'
                 if not os.path.exists(DOWNLOAD_DIR):
                     os.mkdir(DOWNLOAD_DIR, 0755)
                 os.rename(filename, DOWNLOAD_DIR+'/'+filename)
@@ -288,7 +296,7 @@ def parsetweet(tweet):
         print e.output
         if 'format not available' in e.output:
             return 'video '+url+' failed, video not available in HD (720p).'
-        return None
+        return False
     
 
 ##### Queue functions #####

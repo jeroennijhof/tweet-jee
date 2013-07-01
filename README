@@ -22,7 +22,7 @@ Usage: tweet-jee [-h|--help] -s|--server or -p|--player or -i|--initialize or -q
 INSTALL
 
 You need at least python 2.6 and the following modules:
-- python-twitter
+- python-twitter => pip install python_twitter
 - python-urllib2
 - python-sqlite3
 
